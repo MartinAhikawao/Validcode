@@ -1,0 +1,102 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load and preprocess data as before
+file_path = '/content/labelled.csv'
+data = pd.read_csv(file_path)
+data_cleaned = data.drop(columns=['Unnamed: 0', 'C_label'])
+
+label_encoder = LabelEncoder()
+data_cleaned['label_encoded'] = label_encoder.fit_transform(data_cleaned['label'])
+
+X = data_cleaned[['N', 'P', 'K', 'temperature', 'humidity', 'ph']]
+y = data_cleaned['label_encoded']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Define and compile model as before
+model = Sequential([
+    Dense(128, input_dim=X_train.shape[1], activation='relu'),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(64, activation='relu'),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(len(label_encoder.classes_), activation='softmax')
+])
+
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# Train the model
+history = model.fit(X_train, y_train, epochs=100, batch_size=32, validation_split=0.2, verbose=1)
+
+# Evaluate the model
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f'Test Loss: {test_loss}')
+print(f'Test Accuracy: {test_accuracy}')
+
+# Classification report
+y_pred = model.predict(X_test)
+y_pred_classes = np.argmax(y_pred, axis=1)
+report = classification_report(y_test, y_pred_classes, target_names=label_encoder.classes_)
+print(report)
+
+# Confusion matrix
+conf_matrix = confusion_matrix(y_test, y_pred_classes)
+plt.figure(figsize=(10, 8))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.show()
+
+# Plot accuracy and loss
+plt.figure(figsize=(14, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'])
+plt.plot(history.history['val_accuracy'])
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend(['Train', 'Validation'], loc='upper left')
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'])
+plt.plot(history.history['val_loss'])
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend(['Train', 'Validation'], loc='upper left')
+
+plt.show()
+
+# Function to predict the top 4 crops based on input values
+def predict_top_crops(model, input_values, label_encoder):
+    # Predict probabilities for each crop
+    # Convert input_values to a NumPy array
+    input_values = np.array(input_values) 
+    predictions = model.predict(input_values)
+    # Get the top 4 crop indices
+    top_4_indices = predictions.argsort()[0][-4:][::-1]
+    # Decode the indices to get crop names
+    top_4_crops = label_encoder.inverse_transform(top_4_indices)
+    return top_4_crops
+
+# Example input values (N, P, K, temperature, humidity, pH)
+input_values = [[90, 42, 43, 20.88, 82.0, 6.5]]  # Replace with your input values
+
+# Predict the top 4 crops
+top_4_crops = predict_top_crops(model, input_values, label_encoder)
+print(f'Top 4 Crops: {top_4_crops}')
