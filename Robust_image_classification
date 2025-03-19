@@ -1,0 +1,447 @@
+import os
+import random
+import math
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import Xception
+from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, TensorBoard
+from tensorflow.keras.layers import RandomFlip, RandomRotation, RandomZoom, RandomContrast, RandomTranslation, Lambda, GaussianNoise
+from sklearn.model_selection import train_test_split
+from collections import Counter
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.utils.class_weight import compute_class_weight
+import matplotlib.pyplot as plt
+from datetime import datetime
+from tensorflow.keras.utils import Sequence
+import seaborn as sns
+import cv2
+import logging
+from PIL import Image
+
+# Set up mixed precision for better GPU utilization
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+        print("Using GPU with mixed precision")
+    except RuntimeError as e:
+        print(f"Could not set memory growth: {e}")
+
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+# Constants
+SEED = 42
+IMG_HEIGHT = 250
+IMG_WIDTH = 250
+BATCH_SIZE = 16
+DATA_DIR = r"D:\Python Projects\Grizzly_and_Panda"  # Update this path as needed
+CLASSES = ['Grizzly', 'Panda']
+
+# Setup
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+# Random cutout function for augmentation
+def random_cutout(image, mask_size, seed=None):
+    """Apply random cutout to the input image"""
+    if seed is not None:
+        tf.random.set_seed(seed)
+    
+    h, w = mask_size
+    img_h, img_w, _ = image.shape
+    
+    # Generate random coordinates
+    y = tf.random.uniform(shape=[], maxval=img_h - h, dtype=tf.int32)
+    x = tf.random.uniform(shape=[], maxval=img_w - w, dtype=tf.int32)
+    
+    # Create mask
+    mask = tf.ones([h, w, 3])
+    padding = [[y, img_h - y - h], [x, img_w - x - w], [0, 0]]
+    mask = tf.pad(mask, padding)
+    
+    # Apply mask (set cutout region to 0)
+    mask = 1.0 - mask
+    result = image * mask
+    
+    return result
+
+def enhanced_texture_aware_augmentation():
+    return tf.keras.Sequential([
+        # Core spatial augmentations
+        RandomFlip('horizontal', seed=SEED),
+        RandomRotation(0.2, seed=SEED),
+        RandomZoom(0.2, seed=SEED),
+        RandomTranslation(0.1, 0.1, seed=SEED),
+        # Color and texture augmentations
+        Lambda(lambda x: tf.image.adjust_contrast(x, 1.3), dtype='float32'),
+        GaussianNoise(0.1, seed=SEED),
+        Lambda(lambda x: tf.image.random_brightness(x, 0.4, seed=SEED)),
+        Lambda(lambda x: tf.image.random_saturation(x, 0.6, 1.4, seed=SEED)),
+        Lambda(lambda x: tf.image.random_hue(x, 0.1, seed=SEED)),
+        # Apply cutout for robustness
+        Lambda(lambda x: random_cutout(x, mask_size=(40, 40), seed=SEED))
+    ])
+
+def optimize_lab_processing(file_path):
+    """Optimized LAB image processing with error handling"""
+    try:
+        # Use cv2 for faster image processing
+        img = cv2.imread(file_path)
+        if img is None:
+            logging.warning(f"Skipping invalid image: {file_path}")
+            return None
+        
+        # Resize more efficiently
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_AREA)
+        
+        # Convert BGR to LAB more efficiently
+        lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        
+        # Normalize more efficiently
+        lab_img = lab_img.astype(np.float32)
+        lab_img[:,:,0] /= 255.0  # L channel
+        lab_img[:,:,1:] = (lab_img[:,:,1:] - 128) / 127.0  # a and b channels
+        
+        return lab_img
+    except Exception as e:
+        logging.error(f"Failed to process {file_path}: {e}")
+        return None
+
+class OptimizedDataGenerator(Sequence):
+    def __init__(self, file_paths, labels, batch_size, is_training):
+        self.file_paths = file_paths
+        self.labels = labels
+        self.batch_size = batch_size
+        self.is_training = is_training
+        self.augmentation = enhanced_texture_aware_augmentation() if is_training else None
+        self.indexes = np.arange(len(self.file_paths))
+        self.on_epoch_end()
+        
+        # Data optimization options
+        self.options = tf.data.Options()
+        self.options.experimental_optimization.map_parallelization = True
+        self.options.experimental_optimization.parallel_batch = True
+
+    def __len__(self):
+        return int(np.ceil(len(self.file_paths) / self.batch_size))
+
+    def __getitem__(self, idx):
+        # Get the indexes of the current batch
+        batch_indexes = self.indexes[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_paths = [self.file_paths[i] for i in batch_indexes]
+        batch_labels = [self.labels[i] for i in batch_indexes]
+
+        X = []
+        y = []
+
+        for path, label in zip(batch_paths, batch_labels):
+            try:
+                img = optimize_lab_processing(path)
+                if img is None:
+                    continue  # Skip invalid or unprocessable image
+
+                if self.is_training and self.augmentation:
+                    img = tf.cast(img, tf.float32)
+                    img = self.augmentation(tf.expand_dims(img, 0))[0]
+
+                # Use EfficientNet preprocessing
+                img = tf.keras.applications.xception.preprocess_input(img)
+                X.append(img)
+                y.append(label)
+            except Exception as e:
+                logging.error(f"Error processing {path}: {e}")
+                continue  # Skip problematic image
+
+        if not X:
+            # Handle the case where no valid images are in the batch
+            logging.warning(f"No valid images found in batch: {idx}")
+            return tf.convert_to_tensor([], dtype=tf.float32), tf.convert_to_tensor([], dtype=tf.int32)
+        
+        # Convert to TensorFlow tensors
+        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        y = tf.convert_to_tensor(y, dtype=tf.int32)
+
+        return X, y
+
+    def on_epoch_end(self):
+        if self.is_training:
+            np.random.shuffle(self.indexes)
+
+class AdaptiveLearningRateCallback(tf.keras.callbacks.Callback):
+    def __init__(self, patience=3, factor=0.5, min_lr=1e-6, verbose=1):
+        super().__init__()
+        self.patience = patience
+        self.factor = factor
+        self.min_lr = min_lr
+        self.verbose = verbose
+        self.wait = 0
+        self.best_val_loss = float('inf')
+        
+    def on_epoch_end(self, epoch, logs=None):
+        current_val_loss = logs.get('val_loss')
+        if current_val_loss < self.best_val_loss:
+            self.best_val_loss = current_val_loss
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                current_lr = float(self.model.optimizer.learning_rate)
+                new_lr = max(current_lr * self.factor, self.min_lr)
+                if self.verbose > 0:
+                    print(f"\nEpoch {epoch+1}: Reducing learning rate from {current_lr} to {new_lr}")
+                self.model.optimizer.learning_rate = new_lr
+                self.wait = 0
+
+# Replace the create_improved_model function with this:
+
+def create_improved_model(num_classes):
+    # Use Xception as in your original code
+    base_model = tf.keras.applications.Xception(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)
+    )
+    
+    base_model.trainable = False
+
+    inputs = layers.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 3))
+    
+    # Pre-processing and base model
+    x = inputs
+    x = base_model(x)
+    
+    # Texture-specific layers
+    x = layers.GlobalAveragePooling2D()(x)
+    
+    # Dense layers with residual connections
+    residual = layers.Dense(1024)(x)
+    residual = layers.BatchNormalization()(residual)
+    residual = layers.Activation('relu')(residual)
+    
+    x = layers.Dense(1024)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(1024)(x)
+    
+    x = layers.Add()([x, residual])
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    
+    # Additional layers for texture and color
+    x = layers.Dense(512)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(0.4)(x)
+    
+    # Final classification layer
+    x = tf.cast(x, tf.float32)  # Cast back to float32 for final layer
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    
+    model = tf.keras.Model(inputs, outputs)
+    return model, base_model
+
+# Cosine decay with warmup learning rate schedule
+def cosine_decay_with_warmup(initial_lr=1e-4, warmup_steps=500, total_steps=5000, alpha=1e-6):
+    def schedule(step):
+        if step < warmup_steps:
+            return initial_lr * (step / warmup_steps)
+        else:
+            return alpha + (initial_lr - alpha) * (
+                (1 + tf.cos(tf.constant(math.pi) * 
+                           (step - warmup_steps) / 
+                           (total_steps - warmup_steps))) / 2
+            )
+    return tf.keras.optimizers.schedules.LearningRateSchedule(schedule)
+
+# Data preparation
+file_paths = []
+labels = []
+for idx, class_name in enumerate(CLASSES):
+    class_dir = os.path.join(DATA_DIR, class_name)
+    for file_name in os.listdir(class_dir):
+        if file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff')):
+            file_paths.append(os.path.join(class_dir, file_name))
+            labels.append(idx)
+
+# Verify class distribution
+class_counts = Counter(labels)
+print("Overall class distribution:")
+for class_index, count in class_counts.items():
+    print(f"{CLASSES[class_index]}: {count}")
+
+# Check for missing classes
+if len(class_counts) < len(CLASSES):
+    missing_classes = set(range(len(CLASSES))) - set(class_counts.keys())
+    print(f"Warning: Missing classes: {[CLASSES[i] for i in missing_classes]}")
+
+# Compute class weights
+class_weights = compute_class_weight(
+    'balanced',
+    classes=np.unique(labels),
+    y=labels
+)
+class_weight_dict = dict(enumerate(class_weights))
+
+# Split data
+train_paths, val_paths, train_labels, val_labels = train_test_split(
+    file_paths, labels, test_size=0.2, stratify=labels, random_state=SEED
+)
+
+# Create generators
+train_generator = OptimizedDataGenerator(train_paths, train_labels, BATCH_SIZE, True)
+val_generator = OptimizedDataGenerator(val_paths, val_labels, BATCH_SIZE, False)
+
+# Create and compile model
+with tf.device('/GPU:0'):
+    model, base_model = create_improved_model(len(CLASSES))
+
+# Learning rate schedule with warmup
+train_steps = len(train_paths) // BATCH_SIZE
+warmup_steps = train_steps * 2
+total_steps = train_steps * 15  # 15 epochs
+lr_schedule = cosine_decay_with_warmup(
+    initial_lr=1e-4,
+    warmup_steps=warmup_steps,
+    total_steps=total_steps
+)
+
+with tf.device('/GPU:0'):
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+# Callbacks
+log_dir = os.path.join("logs", "fit", datetime.now().strftime("%Y%m%d-%H%M%S"))
+callbacks = [
+    EarlyStopping(patience=20, restore_best_weights=True),
+    ModelCheckpoint('best_model_improved_efficientnet.keras', save_best_only=True),
+    TensorBoard(log_dir=log_dir),
+    AdaptiveLearningRateCallback(patience=3, factor=0.5, min_lr=1e-6)
+]
+
+# Training phases
+print("Phase 1: Training top layers")
+with tf.device('/GPU:0'):
+    history1 = model.fit(
+        train_generator,
+        epochs=15,
+        validation_data=val_generator,
+        callbacks=callbacks,
+        class_weight=class_weight_dict,
+        verbose=1
+    )
+
+print("Phase 2: Fine-tuning")
+with tf.device('/GPU:0'):
+    base_model.trainable = True
+    # Freeze initial layers and train only deeper ones
+    for layer in base_model.layers[:-30]:
+        layer.trainable = False
+
+    # Lower learning rate for fine-tuning
+    fine_tune_lr = cosine_decay_with_warmup(
+        initial_lr=5e-6,  # Lower learning rate for fine tuning
+        warmup_steps=warmup_steps // 2,
+        total_steps=total_steps
+    )
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=fine_tune_lr),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    history2 = model.fit(
+        train_generator,
+        epochs=15,
+        validation_data=val_generator,
+        callbacks=callbacks,
+        class_weight=class_weight_dict,
+        verbose=1
+    )
+
+# Save final model
+with tf.device('/GPU:0'):
+    model.save('final_model_improved_efficientnet_LAB.keras')
+
+# Evaluation and visualization
+predictions = []
+true_labels = []
+
+for i in range(len(val_generator)):
+    batch_images, batch_labels = val_generator[i]
+    if len(batch_images) > 0:  # Check if batch contains images
+        with tf.device('/GPU:0'):
+            pred = model.predict(batch_images)
+        predictions.extend(np.argmax(pred, axis=1))
+        true_labels.extend(batch_labels)
+
+# Confusion matrix
+cm = confusion_matrix(true_labels, predictions)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASSES, yticklabels=CLASSES)
+plt.title("Improved Classification Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.savefig('confusion_matrix.png')
+plt.show()
+
+# Classification report
+print("\nClassification Report:")
+report = classification_report(true_labels, predictions, target_names=CLASSES)
+print(report)
+
+# Save the report to file
+with open('classification_report.txt', 'w') as f:
+    f.write(report)
+
+# Combine training history from both phases
+combined_history = {}
+for key in history1.history.keys():
+    if key in history2.history:
+        combined_history[key] = history1.history[key] + history2.history[key]
+
+
+# Training history visualization
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(combined_history['accuracy'], label='Training Accuracy')
+plt.plot(combined_history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(combined_history['loss'], label='Training Loss')
+plt.plot(combined_history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.tight_layout()
+plt.savefig('training_history.png')
+plt.show()
+
+# Save the model's performance metrics
+performance_metrics = {
+    'accuracy': float(history2.history['val_accuracy'][-1]),
+    'loss': float(history2.history['val_loss'][-1])
+}
+
+import json
+with open('model_performance.json', 'w') as f:
+    json.dump(performance_metrics, f)
+
+print(f"Final validation accuracy: {performance_metrics['accuracy']:.4f}")
+print(f"Final validation loss: {performance_metrics['loss']:.4f}")
